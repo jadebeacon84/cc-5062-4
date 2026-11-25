@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+    <title>巨幅画布 · Vast Canvas</title>
+    <link rel="stylesheet" href="./src/ui/style.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header class="topbar">
+        <div class="brand">
+          <span class="logo">◼</span>
+          <div>
+            <div class="title">巨幅画布</div>
+            <div class="subtitle">按瓦片流式绘制 · 不预分配整幅位图</div>
+          </div>
+        </div>
+        <div class="project-info">
+          <label class="field">
+            <span>工程</span>
+            <select id="project-select" title="打开已有工程或新建"></select>
+          </label>
+          <label class="field">
+            <span>画布</span>
+            <select id="size-select" title="新工程的画布尺寸">
+              <option value="8192x8192">8192 × 8192</option>
+              <option value="30000x20000" selected>30 000 × 20 000 (0.6 GP)</option>
+              <option value="250000x180000">250 000 × 180 000 (45 GP)</option>
+              <option value="1000000x1000000">1 000 000 × 1 000 000 (1 TP)</option>
+            </select>
+          </label>
+          <button id="new-project" class="primary">新建</button>
+          <button id="reopen-project" title="从存储重新加载当前工程">重开工程</button>
+        </div>
+        <div class="actions">
+          <button id="undo" title="撤销 (Ctrl+Z)">撤销</button>
+          <button id="redo" title="重做 (Ctrl+Shift+Z)">重做</button>
+          <button id="export" title="导出 PNG">导出 PNG</button>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <aside class="sidebar">
+          <section class="panel">
+            <h2>画笔</h2>
+            <label class="row">
+              <span>颜色</span>
+              <input id="brush-color" type="color" value="#1c1e26" />
+            </label>
+            <label class="row">
+              <span>半径 <b id="radius-val">6</b> px</span>
+              <input id="brush-radius" type="range" min="1" max="64" step="1" value="6" />
+            </label>
+            <label class="row">
+              <span>不透明度 <b id="opacity-val">100</b>%</span>
+              <input id="brush-opacity" type="range" min="5" max="100" step="5" value="100" />
+            </label>
+            <label class="row">
+              <span>柔边 <b id="hardness-val">65</b>%</span>
+              <input id="brush-hardness" type="range" min="0" max="100" step="5" value="65" />
+            </label>
+            <div class="buttons">
+              <button id="clear-preview" class="ghost" title="丢弃当前未提交的预览笔迹">丢弃预览</button>
+              <button id="fit-view">适应窗口</button>
+            </div>
+          </section>
+
+          <section class="panel">
+            <h2>视图</h2>
+            <div class="zoom-row">
+              <button id="zoom-out">－</button>
+              <input id="zoom" type="range" min="-3" max="6" step="0.01" value="0" />
+              <button id="zoom-in">＋</button>
+            </div>
+            <div class="row small">
+              <span>缩放</span><b id="zoom-val">100%</b>
+            </div>
+            <div class="row small">
+              <span>视口中心</span><b id="center-val">—</b>
+            </div>
+          </section>
+
+          <section class="panel">
+            <h2>瓦片运行时</h2>
+            <dl class="stats">
+              <dt>逻辑尺寸</dt><dd id="stat-size">—</dd>
+              <dt>瓦片尺寸</dt><dd id="stat-tile">—</dd>
+              <dt>已绘制瓦片</dt><dd id="stat-painted">—</dd>
+              <dt>常驻内存</dt><dd id="stat-resident">—</dd>
+              <dt>内存上限</dt><dd id="stat-budget">—</dd>
+              <dt>预览层</dt><dd id="stat-preview">—</dd>
+              <dt>视口瓦片</dt><dd id="stat-visible">—</dd>
+              <dt>本帧绘制 / 缺失</dt><dd id="stat-frame">—</dd>
+              <dt>最近提交</dt><dd id="stat-last-commit">—</dd>
+            </dl>
+          </section>
+
+          <section class="panel">
+            <h2>本次操作</h2>
+            <div class="log" id="log" role="log" aria-live="polite"></div>
+          </section>
+        </aside>
+
+        <section class="stage">
+          <canvas id="viewport" aria-label="绘画画布"></canvas>
+          <div class="hud" id="hud"></div>
+          <div class="canvas-label" id="canvas-label"></div>
+          <div class="toast" id="toast" hidden></div>
+          <div class="busy" id="busy" hidden><span class="spinner"></span><span id="busy-text">处理中…</span></div>
+        </section>
+      </main>
+
+      <footer class="statusbar">
+        <span id="status-left">准备就绪</span>
+        <span id="status-right"></span>
+      </footer>
+    </div>
+    <script type="module" src="./src/ui/main.ts"></script>
+  </body>
+</html>
