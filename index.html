@@ -60,6 +60,10 @@
               <span>柔边 <b id="hardness-val">65</b>%</span>
               <input id="brush-hardness" type="range" min="0" max="100" step="5" value="65" />
             </label>
+            <label class="row small">
+              <span>涂抹（落笔处从画布取色）</span>
+              <input id="brush-smudge" type="checkbox" />
+            </label>
             <div class="buttons">
               <button id="clear-preview" class="ghost" title="丢弃当前未提交的预览笔迹">丢弃预览</button>
               <button id="fit-view">适应窗口</button>
@@ -94,6 +98,21 @@
               <dt>本帧绘制 / 缺失</dt><dd id="stat-frame">—</dd>
               <dt>最近提交</dt><dd id="stat-last-commit">—</dd>
             </dl>
+          </section>
+
+          <section class="panel">
+            <h2>写入追踪 · 诊断</h2>
+            <dl class="stats">
+              <dt>提交 / 回滚</dt><dd id="diag-commits">—</dd>
+              <dt>暂存瓦片版本</dt><dd id="diag-staged">—</dd>
+              <dt>落盘字节</dt><dd id="diag-bytes">—</dd>
+              <dt>证据事件</dt><dd id="diag-events">—</dd>
+              <dt>最近取色</dt><dd id="diag-pick">—</dd>
+            </dl>
+            <div class="buttons">
+              <button id="diag-check" class="ghost" title="直接读取存储，核验已提交瓦片版本是否完整">立即检查</button>
+            </div>
+            <div class="diag-feed" id="diag-feed" aria-live="polite"></div>
           </section>
 
           <section class="panel">

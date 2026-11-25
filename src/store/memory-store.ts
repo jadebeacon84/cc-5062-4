@@ -59,6 +59,11 @@ export class MemoryTileStore implements TileStore {
     return t ? t.slice() : null;
   }
 
+  async statTile(projectId: string, key: string, version: number): Promise<number | null> {
+    const t = this.tiles.get(projectId)?.get(versionKey(key, version));
+    return t ? t.byteLength : null;
+  }
+
   async putTile(projectId: string, key: string, version: number, pixels: Uint8Array): Promise<void> {
     let map = this.tiles.get(projectId);
     if (!map) {

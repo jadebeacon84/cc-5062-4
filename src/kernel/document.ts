@@ -4,10 +4,12 @@ import { createStrokeRenderer, planStroke, StrokeInput, StrokePlan } from './ras
 import { BudgetedLru, tileBytes } from './memory';
 import { CommitAbortedError, InsufficientMemoryError, StorageError } from './errors';
 import { AsyncMutex } from './mutex';
+import { WriteJournal } from './journal';
 import type {
   HistoryEntry,
   ProjectManifest,
   ProjectMeta,
+  StrokeRecord,
   TileChange,
   TileStore,
 } from '../store/types';
@@ -27,6 +29,8 @@ export interface TiledDocumentOptions {
   onTilesChanged?: (info: { tiles: Set<string>; bounds: Rect | null; reason: string }) => void;
   /** Async seam used by tests to interleave commits, flushes and undo. */
   commitBarrier?: (phase: 'begin' | 'after-staging' | 'before-manifest' | 'after-manifest') => Promise<void>;
+  /** Evidence chain for every durability-relevant step. Bounded; see WriteJournal. */
+  journal?: WriteJournal;
 }
 
 export type UndoResult =
@@ -88,6 +92,8 @@ export class TiledDocument {
   private readonly historyLimit: number;
   private readonly onTilesChanged?: TiledDocumentOptions['onTilesChanged'];
   private readonly commitBarrier?: TiledDocumentOptions['commitBarrier'];
+  /** Write-tracking evidence chain; always present so nothing is under-reported. */
+  readonly journal: WriteJournal;
   private readonly lock = new AsyncMutex();
 
   private tiles = new Map<string, TileState>();
@@ -106,6 +112,7 @@ export class TiledDocument {
     this.tileCache = new BudgetedLru<Uint8ClampedArray>('base-tiles', budget);
     this.onTilesChanged = opts.onTilesChanged;
     this.commitBarrier = opts.commitBarrier;
+    this.journal = opts.journal ?? new WriteJournal();
   }
 
   static async open(opts: TiledDocumentOptions): Promise<TiledDocument> {
@@ -155,7 +162,10 @@ export class TiledDocument {
     this.cursor = 0;
     this.seq = 0;
     this.nextVersion = 1;
-    if (!manifest) return;
+    if (!manifest) {
+      this.journal.record({ phase: 'reload', kind: 'reload', commitSeq: 0, ok: true, message: 'no manifest' });
+      return;
+    }
     this.seq = manifest.seq;
     this.nextVersion = manifest.nextVersion;
     this.cursor = Math.max(0, Math.min(manifest.cursor, manifest.history.length));
@@ -165,6 +175,13 @@ export class TiledDocument {
       if (!this.inBounds(tx, ty) || t.v === 0) continue;
       this.tiles.set(key, { tx, ty, version: t.v });
     }
+    this.journal.record({
+      phase: 'reload',
+      kind: 'reload',
+      commitSeq: manifest.seq,
+      ok: true,
+      message: `${this.tiles.size} tiles, cursor ${this.cursor}/${this.history.length}`,
+    });
   }
 
   private inBounds(tx: number, ty: number): boolean {
@@ -317,7 +334,63 @@ export class TiledDocument {
 
   /** Caller must already hold `lock`. */
   private async commitStrokeLocked(input: StrokeInput): Promise<CommitResult> {
-    const renderer = createStrokeRenderer(input, this.grid);
+    // Smudge strokes pick their ink color from the committed canvas before any
+    // tile is touched. The sample goes through the normal committed-tile read
+    // path; if that read fails (color source lost) the commit fails cleanly
+    // instead of fabricating a color.
+    let resolved = input;
+    let strokeRecord: StrokeRecord | undefined;
+    if (input.style.mode === 'smudge') {
+      const first = input.points[0];
+      let sample: { rgba: [number, number, number, number]; key: string; version: number } | null = null;
+      try {
+        sample = first ? await this.sampleCommittedColor(first.x, first.y) : null;
+      } catch (err) {
+        const error = err instanceof Error ? err : new Error(String(err));
+        this.journal.record({
+          phase: 'color-source',
+          kind: 'stroke',
+          commitSeq: this.seq + 1,
+          ok: false,
+          message: `color source unreadable: ${error.message}`,
+        });
+        return { ok: false, error, tilesTouched: 0, pixelsAffected: 0 };
+      }
+      const rgba: [number, number, number, number] = sample ? sample.rgba : [0, 0, 0, 0];
+      resolved = { ...input, style: { ...input.style, color: rgba } };
+      strokeRecord = {
+        tool: 'smudge',
+        points: input.points.map((p) => ({ x: p.x, y: p.y })),
+        style: resolved.style,
+      };
+      if (sample && first) {
+        strokeRecord.colorSource = {
+          key: sample.key,
+          version: sample.version,
+          x: Math.floor(first.x),
+          y: Math.floor(first.y),
+          rgba: sample.rgba,
+        };
+      }
+      this.journal.record({
+        phase: 'color-source',
+        kind: 'stroke',
+        commitSeq: this.seq + 1,
+        key: sample?.key,
+        after: sample?.version,
+        rgba,
+        ok: true,
+        message: sample ? undefined : 'blank canvas: no ink picked up',
+      });
+    } else {
+      strokeRecord = {
+        tool: 'paint',
+        points: input.points.map((p) => ({ x: p.x, y: p.y })),
+        style: input.style,
+      };
+    }
+
+    const renderer = createStrokeRenderer(resolved, this.grid);
     const plan = renderer.plan;
     if (plan.tiles.length === 0) return { ok: true, tilesTouched: 0, pixelsAffected: 0 };
     const edits: PreparedEdit[] = [];
@@ -337,7 +410,41 @@ export class TiledDocument {
       edits.push({ key: tile.key, tx: tile.tx, ty: tile.ty, local: tile.local, pixels: dest });
     }
     if (edits.length === 0) return { ok: true, tilesTouched: 0, pixelsAffected: 0 };
-    return this.commitPreparedLocked(edits, 'stroke', plan.bounds, plan.pixelsPlanned);
+    return this.commitPreparedLocked(edits, 'stroke', plan.bounds, plan.pixelsPlanned, strokeRecord);
+  }
+
+  /**
+   * Committed-pixel color at a canvas point, read through the normal tile
+   * path. Returns null when the point is off-canvas or unpainted.
+   */
+  async sampleColor(
+    x: number,
+    y: number
+  ): Promise<{ rgba: [number, number, number, number]; key: string; version: number } | null> {
+    return this.sampleCommittedColor(x, y);
+  }
+
+  /**
+   * Committed-pixel color at a canvas point, read through the normal tile
+   * path. Returns null when the point is off-canvas or unpainted.
+   */
+  private async sampleCommittedColor(
+    x: number,
+    y: number
+  ): Promise<{ rgba: [number, number, number, number]; key: string; version: number } | null> {
+    const px = Math.floor(x);
+    const py = Math.floor(y);
+    if (px < 0 || py < 0 || px >= this.width || py >= this.height) return null;
+    const tx = Math.floor(px / this.grid.tileSize);
+    const ty = Math.floor(py / this.grid.tileSize);
+    const key = this.grid.tileKey(tx, ty);
+    const state = this.tiles.get(key);
+    if (!state) return null;
+    const tile = await this.getTileByKey(key);
+    if (!tile) return null;
+    const w = this.grid.tilePixelWidth(tx);
+    const o = ((py - ty * this.grid.tileSize) * w + (px - tx * this.grid.tileSize)) * 4;
+    return { rgba: [tile[o], tile[o + 1], tile[o + 2], tile[o + 3]], key, version: state.version };
   }
 
   /**
@@ -362,19 +469,23 @@ export class TiledDocument {
    * The one atomic commit path. Stages immutable tile versions, then swaps a
    * single manifest. Failures before the manifest swap leave both store and
    * memory untouched; the caller observes ok:false and the previous canvas.
+   * Every step is written to the journal as it happens.
    */
   private async commitPreparedLocked(
     edits: PreparedEdit[],
     kind: HistoryEntry['kind'],
     bounds: Rect | null,
-    pixelsAffected: number
+    pixelsAffected: number,
+    stroke?: StrokeRecord
   ): Promise<CommitResult> {
     const staged: { key: string; tx: number; ty: number; version: number; bytes: number; local: Rect; before: number }[] = [];
     let manifestDurable = false;
     let entry: HistoryEntry | undefined;
+    const commitSeq = this.seq + 1;
 
     try {
       await this.commitBarrier?.('begin');
+      this.journal.record({ phase: 'begin', kind, commitSeq, ok: true, message: `${edits.length} tile edit(s)` });
 
       for (const edit of edits) {
         const w = this.grid.tilePixelWidth(edit.tx);
@@ -386,13 +497,38 @@ export class TiledDocument {
         }
         const before = this.tileVersion(edit.key);
         const version = this.nextVersion++;
-        await this.store.putTile(this.projectId, edit.key, version, new Uint8Array(edit.pixels.buffer, edit.pixels.byteOffset, edit.pixels.byteLength));
+        try {
+          await this.store.putTile(this.projectId, edit.key, version, new Uint8Array(edit.pixels.buffer, edit.pixels.byteOffset, edit.pixels.byteLength));
+        } catch (err) {
+          this.journal.record({
+            phase: 'staging-failed',
+            kind,
+            commitSeq,
+            key: edit.key,
+            before,
+            after: version,
+            bytes: edit.pixels.byteLength,
+            ok: false,
+            message: err instanceof Error ? err.message : String(err),
+          });
+          throw err;
+        }
         await this.store.writeHook?.({
           projectId: this.projectId,
           key: edit.key,
           version,
           bytes: edit.pixels.byteLength,
           phase: 'staging',
+        });
+        this.journal.record({
+          phase: 'staging',
+          kind,
+          commitSeq,
+          key: edit.key,
+          before,
+          after: version,
+          bytes: edit.pixels.byteLength,
+          ok: true,
         });
         staged.push({
           key: edit.key,
@@ -423,6 +559,7 @@ export class TiledDocument {
         tilesTouched: staged.length,
         pixelsAffected,
       };
+      if (stroke) entry.stroke = stroke;
 
       const nextHistoryFull = this.history.slice(0, this.cursor).concat(entry);
       const trimmed = trimOldest(nextHistoryFull, this.historyLimit);
@@ -431,6 +568,7 @@ export class TiledDocument {
       for (const s of staged) nextTiles.set(s.key, { tx: s.tx, ty: s.ty, version: s.version });
 
       await this.commitBarrier?.('before-manifest');
+      this.journal.record({ phase: 'before-manifest', kind, commitSeq, ok: true });
       const manifest: ProjectManifest = {
         schemaVersion: 1,
         projectId: this.projectId,
@@ -441,6 +579,8 @@ export class TiledDocument {
         cursor: trimmed.cursor,
         updatedAt: Date.now(),
       };
+      let stagedBytes = 0;
+      for (const s of staged) stagedBytes += s.bytes;
       await this.store.putManifest(manifest);
       manifestDurable = true;
       await this.store.writeHook?.({
@@ -449,6 +589,14 @@ export class TiledDocument {
         version: entry.seq,
         bytes: 0,
         phase: 'manifest',
+      });
+      this.journal.record({
+        phase: 'manifest',
+        kind,
+        commitSeq: entry.seq,
+        bytes: stagedBytes,
+        ok: true,
+        message: `${staged.length} tile version(s) rooted`,
       });
 
       // Publish in memory only after the manifest is durable.
@@ -467,6 +615,7 @@ export class TiledDocument {
           /* over-budget single tile: fall back to store reads */
         }
       }
+      this.journal.record({ phase: 'publish', kind, commitSeq: entry.seq, ok: true });
 
       void this.collectGarbage(trimmed.dropped, discarded);
       await this.commitBarrier?.('after-manifest');
@@ -482,6 +631,13 @@ export class TiledDocument {
             /* unrooted versions are unreachable */
           }
         }
+        this.journal.record({
+          phase: 'rollback',
+          kind,
+          commitSeq,
+          ok: false,
+          message: `${staged.length} staged version(s) discarded: ${error.message}`,
+        });
         return {
           ok: false,
           error:
@@ -513,6 +669,7 @@ export class TiledDocument {
           if (v > 0 && !live.has(`${c.key}@${v}`)) {
             try {
               await this.store.deleteTile(this.projectId, c.key, v);
+              this.journal.record({ phase: 'gc-delete', kind: 'gc', key: c.key, after: v, ok: true });
             } catch {
               /* ignore */
             }
@@ -542,6 +699,7 @@ export class TiledDocument {
       if (!entry) return { ok: false, reason: 'empty', message: 'history boundary reached' };
       const restoring = dir === -1;
       const targetCursor = this.cursor + dir;
+      const journalKind = restoring ? 'undo' : 'redo';
 
       // Validate all source versions before touching any state.
       const source = new Map<string, number>();
@@ -549,6 +707,15 @@ export class TiledDocument {
         const version = restoring ? c.before : c.after;
         source.set(c.key, version);
         if (version > 0 && !(await this.store.getTile(this.projectId, c.key, version))) {
+          this.journal.record({
+            phase: 'history-failed',
+            kind: journalKind,
+            commitSeq: entry.seq,
+            key: c.key,
+            after: version,
+            ok: false,
+            message: `tile ${c.key}@${version} missing from storage`,
+          });
           return {
             ok: false,
             reason: 'storage',
@@ -580,6 +747,13 @@ export class TiledDocument {
       try {
         await this.store.putManifest(manifest);
       } catch (e) {
+        this.journal.record({
+          phase: 'history-failed',
+          kind: journalKind,
+          commitSeq: entry.seq,
+          ok: false,
+          message: e instanceof Error ? e.message : String(e),
+        });
         return { ok: false, reason: 'storage', message: e instanceof Error ? e.message : String(e) };
       }
 
@@ -587,6 +761,13 @@ export class TiledDocument {
       for (const key of changedKeys) this.tileCache.delete(key);
       this.tiles = nextTiles;
       this.cursor = targetCursor;
+      this.journal.record({
+        phase: journalKind,
+        kind: journalKind,
+        commitSeq: entry.seq,
+        ok: true,
+        message: `${changedKeys.size} tile(s) repointed`,
+      });
       this.notify(changedKeys, entry.bounds, restoring ? 'undo' : 'redo');
       return { ok: true, entry };
     });

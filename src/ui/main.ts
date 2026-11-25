@@ -5,6 +5,8 @@ import { CanvasRenderer, Viewport } from '../render/renderer';
 import { IndexedDbTileStore } from '../store/indexeddb-store';
 import { StrokeInput } from '../kernel/raster';
 import { readBackBitmap } from '../kernel/export';
+import { WriteJournal, WriteEvent } from '../kernel/journal';
+import { diagnoseProject } from '../kernel/diagnostics';
 
 const TILE_SIZE = 256;
 const MEMORY_BUDGET = 64 * 1024 * 1024; // 64 MiB of decoded tiles max, regardless of canvas size
@@ -38,6 +40,9 @@ class VastCanvasApp {
   private commitSeq = 0;
   private statsTimer = 0;
   private pendingFit = false;
+  /** Evidence chain for every commit/version/disk-write, shared across reopens. */
+  private readonly journal = new WriteJournal(256);
+  private diagTimer = 0;
   private lastRender: {
     tilesDrawn: number;
     tilesMissing: number;
@@ -53,6 +58,7 @@ class VastCanvasApp {
 
   async start(): Promise<void> {
     this.bindUi();
+    this.journal.onEvent(() => this.refreshDiagSoon());
     await this.refreshProjects();
     const projects = await this.store.listProjects();
     if (projects.length > 0) await this.openProject(projects[0].id);
@@ -88,6 +94,7 @@ class VastCanvasApp {
         memoryBudgetBytes: MEMORY_BUDGET,
         name: `画布 ${formatDims(width, height)}`,
         historyLimit: 48,
+        journal: this.journal,
         onTilesChanged: (info) => {
           this.onTilesCommitted(info.tiles, info.reason);
           this.invalidate(info.reason);
@@ -121,6 +128,7 @@ class VastCanvasApp {
         memoryBudgetBytes: MEMORY_BUDGET,
         projectId: id,
         historyLimit: 48,
+        journal: this.journal,
         onTilesChanged: (info) => {
           this.onTilesCommitted(info.tiles, info.reason);
           this.invalidate(info.reason);
@@ -216,6 +224,12 @@ class VastCanvasApp {
     bindRange('#brush-hardness', '#hardness-val', (v) => {
       this.brush = { ...this.brush, hardness: v / 100 };
     });
+    must<HTMLInputElement>('#brush-smudge').addEventListener('change', (e) => {
+      const on = (e.target as HTMLInputElement).checked;
+      this.brush = { ...this.brush, mode: on ? 'smudge' : 'paint' };
+      log(on ? '涂抹模式：落笔处从已提交画布取色；空白处无墨。' : '实色模式。');
+    });
+    must('#diag-check').addEventListener('click', () => void this.runDiagnostics());
 
     must('#new-project').addEventListener('click', () => {
       const sel = must<HTMLSelectElement>('#size-select');
@@ -449,6 +463,13 @@ class VastCanvasApp {
     this.invalidate('commit');
     const ms = Math.round(performance.now() - started);
     must('#stat-last-commit').textContent = `${result.tilesTouched} 瓦片 / ${ms} ms`;
+    const picked = result.entry?.stroke?.colorSource;
+    if (picked) {
+      log(
+        `涂抹取色 rgba(${picked.rgba[0]},${picked.rgba[1]},${picked.rgba[2]},${picked.rgba[3]}) ← ${picked.key}@v${picked.version}。`,
+        'ok'
+      );
+    }
     log(
       `提交 1 笔：${result.tilesTouched} 个瓦片，${result.pixelsAffected.toLocaleString()} 像素，${ms} ms。`,
       'ok'
@@ -702,6 +723,87 @@ class VastCanvasApp {
     this.statsTimer = window.setTimeout(() => this.refreshStats(), 120);
   }
 
+  // --------------------------------------------------------------- diagnostics
+
+  private refreshDiagSoon(): void {
+    clearTimeout(this.diagTimer);
+    this.diagTimer = window.setTimeout(() => this.refreshDiag(), 80);
+  }
+
+  /** Render the evidence chain: exact counters plus the newest tile updates. */
+  private refreshDiag(): void {
+    const snap = this.journal.snapshot();
+    const commits = snap.phases['manifest'] ?? 0;
+    const rollbacks = snap.phases['rollback'] ?? 0;
+    must('#diag-commits').textContent = `${commits} / ${rollbacks}`;
+    must('#diag-staged').textContent = String(snap.phases['staging'] ?? 0);
+    must('#diag-bytes').textContent = formatBytes(snap.bytesStaged);
+    must('#diag-events').textContent =
+      snap.droppedEvents > 0 ? `${snap.totalEvents}（截断 ${snap.droppedEvents}）` : String(snap.totalEvents);
+
+    // The most recent color a smudge stroke actually picked, and its source.
+    const pick = this.journal.recent(64).find((e) => e.phase === 'color-source');
+    must('#diag-pick').textContent = pick
+      ? pick.rgba
+        ? `rgb(${pick.rgba[0]},${pick.rgba[1]},${pick.rgba[2]}) ← ${pick.key ?? '空白'}${pick.after ? `@v${pick.after}` : ''}`
+        : (pick.message ?? '—')
+      : '—';
+
+    const feed = must('#diag-feed');
+    feed.innerHTML = '';
+    for (const e of this.journal.recent(10)) {
+      const line = document.createElement('div');
+      line.className = 'ev';
+      const ph = document.createElement('span');
+      ph.className = 'ph';
+      ph.textContent = phaseLabel(e.phase);
+      const body = document.createElement('span');
+      body.textContent = describeEvent(e);
+      if (e.ok === false) body.className = 'bad';
+      else if (e.phase === 'color-source') body.className = 'pick';
+      line.append(ph, body);
+      feed.appendChild(line);
+    }
+  }
+
+  /**
+   * Verify the committed tiles straight from the store (never the decoded-tile
+   * cache), then say plainly what is lost, what is leftover, or that all is
+   * well.
+   */
+  private async runDiagnostics(): Promise<void> {
+    if (!this.doc) return;
+    this.setBusy(true, '正在核验存储中的已提交瓦片…');
+    try {
+      const report = await diagnoseProject(this.store, this.doc.projectId);
+      const t = report.totals;
+      if (report.ok && t.orphan === 0) {
+        toast(`存储核验通过：${report.referencedVersions} 个已提交版本全部完好。`, 'success');
+        log(`诊断：${report.referencedVersions} 个引用版本均在存储中，无丢失、无残留。`, 'ok');
+      } else {
+        if (t.missing + t.corrupt > 0) {
+          toast(`已提交数据丢失：${t.missing} 个版本缺失、${t.corrupt} 个字节损坏。详见日志。`, 'error');
+          for (const a of report.missingCommitted.slice(0, 6)) {
+            const ref = a.referencedBy[0];
+            log(
+              `丢失 ${a.key}@v${a.version}（${a.stage === 'committed-current' ? '当前画布' : '撤销载荷'}，` +
+                `${ref.crossBlock ? '跨块笔画' : '单笔'} #${ref.commitSeq ?? '?'}，期望 ${a.expectedBytes ?? '?'} B）`,
+              'err'
+            );
+          }
+        }
+        if (t.orphan > 0) {
+          log(`诊断：${t.orphan} 个未提交残留版本（中断的编辑，不影响画面），可重开工程清理。`, 'warn');
+        }
+      }
+      this.refreshDiag();
+    } catch (e) {
+      this.reportError('诊断失败', e);
+    } finally {
+      this.setBusy(false);
+    }
+  }
+
   private refreshStats(): void {
     if (!this.doc) return;
     const d = this.doc;
@@ -851,6 +953,33 @@ class VastCanvasApp {
     this.invalidate('debug-reload');
     this.refreshStats();
   }
+  journalSnapshotForDebug() {
+    return this.journal.snapshot();
+  }
+  journalEventsForDebug(n = 10) {
+    return this.journal.recent(n).map((e) => ({
+      phase: e.phase,
+      kind: e.kind,
+      key: e.key,
+      before: e.before,
+      after: e.after,
+      bytes: e.bytes,
+      ok: e.ok,
+      commitSeq: e.commitSeq,
+      rgba: e.rgba ? [...e.rgba] : undefined,
+    }));
+  }
+  async diagnoseForDebug() {
+    if (!this.doc) throw new Error('no document');
+    return diagnoseProject(this.store, this.doc.projectId);
+  }
+  setSmudgeForDebug(on: boolean): void {
+    this.brush = { ...this.brush, mode: on ? 'smudge' : 'paint' };
+    must<HTMLInputElement>('#brush-smudge').checked = on;
+  }
+  diagFeedTextForDebug(): string {
+    return must('#diag-feed').textContent ?? '';
+  }
 }
 
 // ------------------------------------------------------------------ helpers
@@ -928,6 +1057,52 @@ function formatBytes(n: number): string {
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KiB`;
   if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MiB`;
   return `${(n / 1024 / 1024 / 1024).toFixed(2)} GiB`;
+}
+
+function phaseLabel(phase: WriteEvent['phase']): string {
+  switch (phase) {
+    case 'begin': return '开始';
+    case 'color-source': return '取色';
+    case 'staging': return '暂存';
+    case 'staging-failed': return '暂存失败';
+    case 'before-manifest': return '待落簿';
+    case 'manifest': return '落簿';
+    case 'publish': return '发布';
+    case 'rollback': return '回滚';
+    case 'gc-delete': return '回收';
+    case 'undo': return '撤销';
+    case 'redo': return '重做';
+    case 'history-failed': return '历史失败';
+    case 'reload': return '重载';
+  }
+}
+
+/** One-line, human-readable rendering of a write-tracking event. */
+function describeEvent(e: WriteEvent): string {
+  switch (e.phase) {
+    case 'staging':
+      return `瓦片 ${e.key} v${e.before ?? 0}→v${e.after} · ${formatBytes(e.bytes ?? 0)}`;
+    case 'staging-failed':
+      return `瓦片 ${e.key} 写入失败：${e.message ?? ''}`;
+    case 'manifest':
+      return `提交 #${e.commitSeq} 生效 · ${formatBytes(e.bytes ?? 0)}`;
+    case 'color-source':
+      return e.rgba
+        ? `rgba(${e.rgba[0]},${e.rgba[1]},${e.rgba[2]},${e.rgba[3]}) ← ${e.key ?? '空白'}${e.after ? `@v${e.after}` : ''}`
+        : (e.message ?? '');
+    case 'rollback':
+    case 'history-failed':
+      return e.message ?? '';
+    case 'gc-delete':
+      return `回收 ${e.key}@v${e.after}`;
+    case 'reload':
+      return e.message ?? '';
+    case 'undo':
+    case 'redo':
+      return `#${e.commitSeq} · ${e.message ?? ''}`;
+    default:
+      return e.message ?? `#${e.commitSeq ?? '—'}`;
+  }
 }
 
 export async function encodePngInBrowser(
@@ -1010,4 +1185,9 @@ void (async () => {
   regionHash: (rect: Rect) => app.regionHashForDebug(rect),
   renderStats: () => app.renderStatsForDebug(),
   visibleInk: () => app.visibleInkForDebug(),
+  journalSnapshot: () => app.journalSnapshotForDebug(),
+  journalEvents: (n?: number) => app.journalEventsForDebug(n),
+  diagnose: () => app.diagnoseForDebug(),
+  setSmudge: (on: boolean) => app.setSmudgeForDebug(on),
+  diagFeedText: () => app.diagFeedTextForDebug(),
 };

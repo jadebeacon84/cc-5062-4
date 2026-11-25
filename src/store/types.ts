@@ -1,4 +1,5 @@
 import type { Rect } from '../kernel/geometry';
+import type { BrushStyle } from '../kernel/brush';
 
 export interface ProjectMeta {
   id: string;
@@ -25,6 +26,33 @@ export interface TileChange {
   bytes: number;
 }
 
+/**
+ * Durable, replayable record of one stroke, stored on its history entry. This
+ * is the transaction log the recovery replay rebuilds from.
+ *
+ * - 'paint' strokes carry the full style (color included): they replay
+ *   anywhere, across any tile boundary.
+ * - 'smudge' strokes pick their ink color from the base image. New records
+ *   carry the resolved `colorSource` (tile revision + sampled rgba), so a
+ *   replay can verify the pre-modification neighbor still exists. Legacy
+ *   records (`colorSource` and `style` absent) only record positions; they
+ *   can only be replayed faithfully when the canvas state they sampled from
+ *   is still reconstructible.
+ */
+export interface StrokeRecord {
+  tool: 'paint' | 'smudge';
+  points: { x: number; y: number }[];
+  /** Full style for 'paint'; resolved style (picked color) for new 'smudge'. */
+  style?: BrushStyle;
+  colorSource?: {
+    key: string;
+    version: number;
+    x: number;
+    y: number;
+    rgba: readonly [number, number, number, number];
+  };
+}
+
 export interface HistoryEntry {
   id: string;
   seq: number;
@@ -34,6 +62,8 @@ export interface HistoryEntry {
   changes: TileChange[];
   tilesTouched: number;
   pixelsAffected: number;
+  /** Replay payload; absent for composite edits and pre-journal history. */
+  stroke?: StrokeRecord;
 }
 
 export interface ProjectManifest {
@@ -79,6 +109,14 @@ export interface TileStore {
   putTile(projectId: string, key: string, version: number, pixels: Uint8Array): Promise<void>;
   deleteTile(projectId: string, key: string, version: number): Promise<void>;
   listTileVersions(projectId: string): Promise<TileVersionKey[]>;
+
+  /**
+   * Optional cheap existence/size probe. Diagnostics prefer this over
+   * `getTile` so verifying a version does not download its pixels; stores
+   * that cannot stat (e.g. IndexedDB) simply omit it and diagnostics fall
+   * back to a real read.
+   */
+  statTile?(projectId: string, key: string, version: number): Promise<number | null>;
 
   /** Optional fault-injection / instrumentation seam used by tests. */
   writeHook?: TileWriteHook;

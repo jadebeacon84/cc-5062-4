@@ -44,6 +44,27 @@ declare global {
       }>;
       renderStats: () => { previewFactor: number; tilesDrawn: number; tilesMissing: number } | null;
       visibleInk: () => { inked: number; sampled: number; previewFactor: number };
+      journalSnapshot: () => {
+        totalEvents: number;
+        droppedEvents: number;
+        phases: Record<string, number>;
+        bytesStaged: number;
+        failures: number;
+      };
+      journalEvents: (n?: number) => {
+        phase: string;
+        key?: string;
+        after?: number;
+        ok?: boolean;
+        rgba?: number[];
+      }[];
+      diagnose: () => Promise<{
+        ok: boolean;
+        totals: { missing: number; corrupt: number; orphan: number };
+        referencedVersions: number;
+      }>;
+      setSmudge: (on: boolean) => void;
+      diagFeedText: () => string;
     };
   }
 }
@@ -295,5 +316,81 @@ test.describe('vast canvas painting window', () => {
     // PNG signature and non-trivial payload.
     expect([...buf.subarray(0, 8)]).toEqual([137, 80, 78, 71, 13, 10, 26, 10]);
     expect(buf.length).toBeGreaterThan(1000);
+  });
+
+  test('diagnostics panel tracks tile updates with reasons while drawing', async ({ page }) => {
+    await boot(page);
+    // Zoom out and draw a real continuous drag across tiles.
+    const box = (await page.locator('#viewport').boundingBox())!;
+    const cx = box.x + box.width / 2;
+    const cy = box.y + box.height / 2;
+    for (let i = 0; i < 8; i++) {
+      await page.mouse.move(cx, cy);
+      await page.mouse.wheel(0, -120);
+      await page.waitForTimeout(15);
+    }
+    await page.mouse.move(cx - 220, cy - 60);
+    await page.mouse.down();
+    for (let i = 0; i <= 36; i++) {
+      await page.mouse.move(cx - 220 + i * 12, cy - 60 + Math.sin(i / 5) * 70);
+    }
+    await page.mouse.up();
+    await page.waitForTimeout(900);
+
+    // The evidence chain recorded the commit's real phases.
+    const snap = await page.evaluate(() => window.__vast.journalSnapshot());
+    expect(snap.phases['staging']).toBeGreaterThan(0);
+    expect(snap.phases['manifest']).toBeGreaterThan(0);
+    expect(snap.failures).toBe(0);
+    // The panel shows the same truth: counters and a tile-update feed.
+    await expect(page.locator('#diag-commits')).not.toHaveText('—');
+    await expect
+      .poll(async () => page.evaluate(() => window.__vast.diagFeedText()))
+      .toContain('瓦片');
+    // Visible ink on screen agrees with the committed stroke (actual pixels).
+    const ink = await page.evaluate(() => window.__vast.visibleInk());
+    expect(ink.inked).toBeGreaterThan(0);
+
+    // Store verification through the UI: everything committed is intact.
+    const report = await page.evaluate(() => window.__vast.diagnose());
+    expect(report.ok).toBe(true);
+    expect(report.totals).toEqual({ missing: 0, corrupt: 0, orphan: 0 });
+    await page.click('#diag-check');
+    await expect(page.locator('#toast')).toContainText('核验通过');
+  });
+
+  test('smudge picks the real color from the committed canvas', async ({ page }) => {
+    await boot(page);
+    // A committed red stroke as the color source.
+    const base = await page.evaluate(() =>
+      window.__vast.commitStroke([{ x: 3000, y: 3000 }, { x: 7000, y: 7000 }], {
+        radius: 80,
+        color: [215, 25, 25, 255],
+      })
+    );
+    expect(base.ok).toBe(true);
+
+    // Smudge starting on the red ink: the picked color must come from the
+    // canvas, not from the current brush color (which is near-black).
+    const sm = await page.evaluate(() =>
+      window.__vast.commitStroke([{ x: 5000, y: 5000 }, { x: 8600, y: 4200 }], {
+        radius: 60,
+        mode: 'smudge',
+      })
+    );
+    expect(sm.ok).toBe(true);
+    const events = await page.evaluate(() => window.__vast.journalEvents(80));
+    const pick = events.find((e) => e.phase === 'color-source');
+    expect(pick).toBeDefined();
+    expect(pick!.rgba![0]).toBeGreaterThan(150);
+    expect(pick!.rgba![1]).toBeLessThan(90);
+    expect(pick!.key).toBeTruthy();
+
+    // The picked color is pinned in the diagnostics panel and the stroke is visible.
+    await expect(page.locator('#diag-pick')).toContainText('rgb(2', { timeout: 15000 });
+    const pickText = await page.locator('#diag-pick').textContent();
+    expect(pickText).toContain('←');
+    const report = await page.evaluate(() => window.__vast.diagnose());
+    expect(report.ok).toBe(true);
   });
 });

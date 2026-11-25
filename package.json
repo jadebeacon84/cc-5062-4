@@ -9,7 +9,8 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "test:watch": "vitest",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "diagnose": "vite-node src/cli/diagnose.ts"
   },
   "repository": {
     "type": "git",

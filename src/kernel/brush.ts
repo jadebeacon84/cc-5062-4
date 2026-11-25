@@ -9,6 +9,12 @@ export interface BrushStyle {
   opacity: number;
   /** 0 = hard edge, 1 = fully soft. */
   hardness: number;
+  /**
+   * 'paint' uses `color` as-is. 'smudge' picks its ink color from the
+   * committed canvas under the stroke's first point before any tile is
+   * modified; on blank canvas it picks up no ink and the stroke is a no-op.
+   */
+  mode?: 'paint' | 'smudge';
 }
 
 export const DEFAULT_BRUSH: BrushStyle = {

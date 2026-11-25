@@ -96,6 +96,16 @@ export class FsTileStore implements TileStore {
     }
   }
 
+  async statTile(projectId: string, key: string, version: number): Promise<number | null> {
+    try {
+      const st = await fs.stat(this.tilePath(projectId, key, version));
+      return st.size;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw e;
+    }
+  }
+
   async putTile(projectId: string, key: string, version: number, pixels: Uint8Array): Promise<void> {
     const file = this.tilePath(projectId, key, version);
     await fs.mkdir(path.dirname(file), { recursive: true });
@@ -115,19 +125,28 @@ export class FsTileStore implements TileStore {
   }
 
   async listTileVersions(projectId: string): Promise<TileVersionKey[]> {
-    let files: string[];
-    try {
-      files = await fs.readdir(this.tileDir(projectId));
-    } catch {
-      return [];
-    }
+    // Tiles are nested one level per tx (see tilePath); walk the tree.
     const out: TileVersionKey[] = [];
-    for (const f of files) {
-      if (!f.endsWith('.bin')) continue;
-      const base = f.slice(0, -4);
-      const at = base.lastIndexOf('@');
-      out.push({ key: base.slice(0, at), version: Number(base.slice(at + 1)) });
-    }
+    const walk = async (rel: string): Promise<void> => {
+      let entries: import('node:fs').Dirent[];
+      try {
+        entries = await fs.readdir(path.join(this.tileDir(projectId), rel), { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const e of entries) {
+        const child = rel ? path.join(rel, e.name) : e.name;
+        if (e.isDirectory()) {
+          await walk(child);
+          continue;
+        }
+        if (!e.name.endsWith('.bin')) continue;
+        const base = e.name.slice(0, -4);
+        const at = base.lastIndexOf('@');
+        out.push({ key: base.slice(0, at), version: Number(base.slice(at + 1)) });
+      }
+    };
+    await walk('');
     return out;
   }
 
